@@ -9,6 +9,7 @@ on:
     branches: [ master ]
     paths-ignore:
       - '**.md'
+  workflow_dispatch: # ← 手动触发开关
 
 env:
   proc_num: $(nproc)
