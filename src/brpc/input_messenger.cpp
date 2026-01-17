@@ -29,7 +29,7 @@
 #include "brpc/protocol.h"                 // ListProtocols
 #include "brpc/rdma/rdma_endpoint.h"
 #include "brpc/input_messenger.h"
-
+#include "brpc/transport_factory.h"
 
 namespace brpc {
 
@@ -112,8 +112,7 @@ ParseResult InputMessenger::CutInputMessage(
                     // The length of `data' must be PROTO_DUMMY_LEN + 1 to store extra ending char '\0'
                     char data[PROTO_DUMMY_LEN + 1];
                     m->_read_buf.copy_to_cstr(data, PROTO_DUMMY_LEN);
-                    if (strncmp(data, "RDMA", PROTO_DUMMY_LEN) == 0 &&
-                        m->_rdma_state == Socket::RDMA_OFF) {
+                    if (strncmp(data, "RDMA", PROTO_DUMMY_LEN) == 0) {
                         // To avoid timeout when client uses RDMA but server uses TCP
                         return MakeParseError(PARSE_ERROR_TRY_OTHERS);
                     }
@@ -224,13 +223,13 @@ static void QueueMessage(InputMessageBase* to_run_msg,
     }
 }
 
-InputMessenger::InputMessageClosure::~InputMessageClosure() noexcept(false) {
+InputMessageClosure::~InputMessageClosure() noexcept(false) {
     if (_msg) {
         ProcessInputMessage(_msg);
     }
 }
 
-void InputMessenger::InputMessageClosure::reset(InputMessageBase* m) {
+void InputMessageClosure::reset(InputMessageBase* m) {
     if (_msg) {
         ProcessInputMessage(_msg);
     }
@@ -303,7 +302,8 @@ int InputMessenger::ProcessNewMessage(
         // This unique_ptr prevents msg to be lost before transfering
         // ownership to last_msg
         DestroyingPtr<InputMessageBase> msg(pr.message());
-        QueueMessage(last_msg.release(), &num_bthread_created, m->_keytable_pool);
+        // QueueMessage(last_msg.release(), &num_bthread_created, m->_keytable_pool, m->socket_mode);
+        m->_transport->QueueMessage(last_msg, &num_bthread_created, false);
         if (_handlers[index].process == NULL) {
             LOG(ERROR) << "process of index=" << index << " is NULL";
             continue;
@@ -336,22 +336,19 @@ int InputMessenger::ProcessNewMessage(
             // Transfer ownership to last_msg
             last_msg.reset(msg.release());
         } else {
-            QueueMessage(msg.release(), &num_bthread_created,
-                                m->_keytable_pool);
+            last_msg.reset(msg.release());
+            m->_transport->QueueMessage(last_msg, &num_bthread_created, false);
             bthread_flush();
             num_bthread_created = 0;
         }
     }
-#if BRPC_WITH_RDMA
     // In RDMA polling mode, all messages must be executed in a new bthread and
     // not in the bthread where the polling bthread is located, because the
     // method for processing messages may call synchronization primitives,
     // causing the polling bthread to be scheduled out.
-    if (rdma::FLAGS_rdma_use_polling) {
-        QueueMessage(last_msg.release(), &num_bthread_created,
-                     m->_keytable_pool);
+    if (m->_socket_mode == RDMA) {
+        m->_transport->QueueMessage(last_msg, &num_bthread_created, true);
     }
-#endif
     if (num_bthread_created) {
         bthread_flush();
     }
@@ -414,8 +411,7 @@ void InputMessenger::OnNewMessages(Socket* m) {
             }
         }
 
-        if (m->_rdma_state == Socket::RDMA_OFF && messenger->ProcessNewMessage(
-                    m, nr, read_eof, received_us, base_realtime, last_msg) < 0) {
+        if (messenger->ProcessNewMessage(m, nr, read_eof, received_us, base_realtime, last_msg) < 0) {
             return;
         } 
     }
@@ -533,16 +529,7 @@ int InputMessenger::Create(const butil::EndPoint& remote_side,
 
 int InputMessenger::Create(SocketOptions options, SocketId* id) {
     options.user = this;
-#if BRPC_WITH_RDMA
-    if (options.use_rdma) {
-        options.on_edge_triggered_events = rdma::RdmaEndpoint::OnNewDataFromTcp;
-        options.app_connect = std::make_shared<rdma::RdmaConnect>();
-    } else {
-#else
-    {
-#endif
-        options.on_edge_triggered_events = OnNewMessages;
-    }
+    options.need_on_edge_trigger = true;
     // Enable keepalive by options or Gflag.
     // Priority: options > Gflag.
     if (options.keepalive_options || FLAGS_socket_keepalive) {
